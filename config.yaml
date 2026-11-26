@@ -1,0 +1,38 @@
+# ============================================================
+#  Mini-SOC AI Agent — Cấu hình
+# ============================================================
+
+# --- Wazuh ---
+wazuh:
+  alerts_file: "/var/ossec/logs/alerts/alerts.json"
+  min_level: 7                      # Chỉ xử lý alert level >= 7
+  lookback_minutes: 10              # query_recent_logs nhìn lại bao nhiêu phút
+
+# --- DeepSeek API (api_key được nạp từ biến môi trường DEEPSEEK_API_KEY / file .env) ---
+llm:
+  base_url: "https://api.deepseek.com"
+  model: "DeepSeek-V4.1-Flash-1017"
+  max_tokens: 1024
+  temperature: 0.2                  # Thấp để output ổn định, ít hallucination
+
+# --- Telegram (bot_token & chat_id được nạp từ TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID / file .env) ---
+telegram: {}
+
+# --- Whitelist IPs (không bao giờ block) ---
+whitelist:
+  - "127.0.0.1"       # local host
+  - "192.168.147.172"   # Gateway chính nó 
+  - "8.8.8.8"         # DNS
+
+# --- File log chi tiết ---
+logging:
+  detail_log: "/var/log/mini-soc/agent_detail.log"
+  action_log: "/var/log/mini-soc/agent_actions.log"
+
+# --- nftables ---
+nftables:
+  family: "inet"
+  table: "filter"
+  chains:
+    - "input"
+    - "forward"
