@@ -11,7 +11,7 @@ import threading
 from datetime import datetime
 
 from config_loader import load_config
-from llm_client import run_agent
+from llm_client import _extract_source_ip, run_agent
 from notifier import notify_all
 from responder import TelegramResponder
 
@@ -19,13 +19,15 @@ from responder import TelegramResponder
 # ============================================================
 # Deduplication — tránh xử lý cùng 1 alert nhiều lần
 # ============================================================
-class AlertDeduplicator:
+class AlertDeduplicator:    
     def __init__(self, ttl_seconds: int = 60):
         self._seen: dict[str, float] = {}
         self._ttl = ttl_seconds
         self._lock = threading.Lock()
 
     def is_new(self, alert_id: str) -> bool:
+        if self._ttl <= 0:
+            return True
         now = time.time()
         with self._lock:
             # Dọn dẹp các entry cũ
@@ -96,9 +98,16 @@ class AlertTailer:
 # ============================================================
 # Xử lý từng alert
 # ============================================================
-def process_alert(alert: dict, min_level: int, dedup: AlertDeduplicator):
+def process_alert(
+    alert: dict,
+    min_level: int,
+    dedup: AlertDeduplicator,
+    cooldown: AlertDeduplicator,
+    ignore_rules: set[str],
+    ignore_groups: set[str]
+):
     """
-    Kiểm tra level, dedup, rồi chạy Agent nếu hợp lệ.
+    Kiểm tra level, rule bỏ qua, dedup, cooldown theo IP, rồi chạy Agent nếu hợp lệ.
     Chạy trong thread riêng để không block vòng lặp chính.
     """
     rule = alert.get("rule", {})
@@ -113,9 +122,25 @@ def process_alert(alert: dict, min_level: int, dedup: AlertDeduplicator):
     if level < min_level:
         return
 
+    # Lọc bỏ qua theo rule.id
+    rule_id = str(rule.get("id", ""))
+    if rule_id in ignore_rules:
+        return
+
+    # Lọc bỏ qua theo rule.groups
+    rule_groups = set(str(g).lower() for g in rule.get("groups", []))
+    if rule_groups & ignore_groups:
+        return
+
     # Deduplication theo alert id hoặc nội dung
     alert_id = alert.get("id") or f"{alert.get('timestamp','')}_{rule.get('id','')}_{alert.get('agent',{}).get('ip','')}"
     if not dedup.is_new(alert_id):
+        return
+
+    # Cooldown theo (IP nguồn, rule_id): cùng IP + cùng loại tấn công mới bỏ qua, đổi loại tấn công vẫn báo
+    src_ip = _extract_source_ip(alert)
+    cooldown_key = f"ip:{src_ip}|rule:{rule_id}"
+    if not cooldown.is_new(cooldown_key):
         return
 
     ts = datetime.now().strftime("%H:%M:%S")
@@ -140,6 +165,9 @@ def main():
     cfg = load_config()
     alerts_file = cfg["wazuh"]["alerts_file"]
     min_level = cfg["wazuh"]["min_level"]
+    cooldown_seconds = int(cfg["wazuh"].get("cooldown_seconds", 300))
+    ignore_rules = set(str(r) for r in cfg["wazuh"].get("ignore_rules", []))
+    ignore_groups = set(str(g).lower() for g in cfg["wazuh"].get("ignore_groups", []))
 
     # Kiểm tra file tồn tại
     if not os.path.exists(alerts_file):
@@ -151,6 +179,11 @@ def main():
     print("  Mini-SOC AI Agent đang khởi động...")
     print(f"  File alerts : {alerts_file}")
     print(f"  Min level   : {min_level}")
+    print(f"  Cooldown    : {cooldown_seconds}s / IP")
+    if ignore_rules:
+        print(f"  Ignore rules: {', '.join(sorted(ignore_rules))}")
+    if ignore_groups:
+        print(f"  Ignore grps : {', '.join(sorted(ignore_groups))}")
     print(f"  LLM         : {cfg['llm']['model']}")
     print("=" * 55)
 
@@ -161,6 +194,7 @@ def main():
     # Khởi động tailer
     tailer = AlertTailer(alerts_file)
     dedup = AlertDeduplicator(ttl_seconds=60)
+    cooldown = AlertDeduplicator(ttl_seconds=cooldown_seconds)
 
     # Graceful shutdown
     _shutdown = threading.Event()
@@ -181,7 +215,7 @@ def main():
             for line in lines:
                 try:
                     alert = json.loads(line)
-                    process_alert(alert, min_level, dedup)
+                    process_alert(alert, min_level, dedup, cooldown, ignore_rules, ignore_groups)
                 except json.JSONDecodeError:
                     continue
 
