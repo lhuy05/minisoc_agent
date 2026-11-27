@@ -6,6 +6,7 @@ import json
 import os
 import requests
 from datetime import datetime
+from html import escape
 
 from config_loader import load_config
 
@@ -107,15 +108,15 @@ def send_telegram(result: dict):
     icon = {"CRITICAL": "🔴", "HIGH": "🟠", "MEDIUM": "🟡", "LOW": "🟢"}.get(severity, "⚪")
 
     text = (
-        f"{icon} *CẢNH BÁO AN NINH — {severity}*\n"
+        f"{icon} <b>CẢNH BÁO AN NINH — {escape(str(severity))}</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"🌐 *IP nguồn:* `{src_ip}`\n"
-        f"⚔️ *Tấn công:* {result.get('attack_type', 'N/A')}\n"
-        f"🎯 *MITRE:* {result.get('mitre_technique', 'N/A')}\n"
-        f"🔌 *Còn active:* {'⚠ CÒN KẾT NỐI' if result.get('still_active') else 'Không'}\n"
+        f"🌐 <b>IP nguồn:</b> <code>{escape(str(src_ip))}</code>\n"
+        f"⚔️ <b>Tấn công:</b> {escape(str(result.get('attack_type', 'N/A')))}\n"
+        f"🎯 <b>MITRE:</b> {escape(str(result.get('mitre_technique', 'N/A')))}\n"
+        f"🔌 <b>Còn active:</b> {'⚠ CÒN KẾT NỐI' if result.get('still_active') else 'Không'}\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"📋 *Tóm tắt:* {result.get('summary', '')}\n\n"
-        f"💡 *Đề xuất:* {result.get('recommendation', '')}"
+        f"📋 <b>Tóm tắt:</b> {escape(str(result.get('summary', '')))}\n\n"
+        f"💡 <b>Đề xuất:</b> {escape(str(result.get('recommendation', '')))}"
     )
 
     # Chỉ hiện nút BLOCK nếu agent đề xuất block và IP không trong whitelist
@@ -146,7 +147,7 @@ def send_telegram(result: dict):
     payload = {
         "chat_id": chat_id,
         "text": text,
-        "parse_mode": "Markdown",
+        "parse_mode": "HTML",
         "reply_markup": json.dumps(keyboard)
     }
 
@@ -163,5 +164,8 @@ def send_telegram(result: dict):
 # ============================================================
 def notify_all(result: dict, raw_alert: dict):
     print_console(result)
-    write_detail_log(result, raw_alert)
+    try:
+        write_detail_log(result, raw_alert)
+    except OSError as e:
+        print(f"[Log] Không ghi được agent_detail.log: {e}")
     send_telegram(result)

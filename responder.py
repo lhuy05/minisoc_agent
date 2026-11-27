@@ -4,6 +4,7 @@ responder.py — Lắng nghe callback từ Telegram, thực thi block IP qua nft
 
 import ipaddress
 import json
+import re
 import subprocess
 import threading
 import time
@@ -13,6 +14,9 @@ from config_loader import load_config
 from llm_client import handle_admin_query
 from notifier import write_action_log
 from tools import check_ip_whitelist, query_detail_logs
+
+
+_NFTABLES_RULE_COMMENT = "mini-soc-managed"
 
 
 # ============================================================
@@ -44,7 +48,7 @@ def block_ip(src_ip: str) -> tuple[bool, str]:
                 "nft", "insert", "rule",
                 family, table, chain,
                 addr_family, "saddr", src_ip,
-                "drop"
+                "drop", "comment", _NFTABLES_RULE_COMMENT
             ]
             result = subprocess.run(
                 cmd,
@@ -74,6 +78,93 @@ def block_ip(src_ip: str) -> tuple[bool, str]:
         msg = f"Lỗi: {str(e)}"
         write_action_log("block_ip", src_ip, False, msg)
         return False, msg
+
+
+def unblock_ip(src_ip: str) -> tuple[bool, str]:
+    """Gỡ các rule drop do Mini-SOC tạo cho IP này."""
+    try:
+        ip_obj = ipaddress.ip_address(src_ip)
+    except ValueError:
+        msg = f"IP không hợp lệ: {src_ip}"
+        write_action_log("unblock_ip", src_ip, False, msg)
+        return False, msg
+
+    src_ip = str(ip_obj)
+    cfg = load_config()
+    nft = cfg.get("nftables", {})
+    family = nft.get("family", "inet")
+    table = nft.get("table", "filter")
+    chains = nft.get("chains") or [nft.get("input_chain", "input")]
+    addr_family = "ip6" if ip_obj.version == 6 else "ip"
+    rule_pattern = re.compile(
+        rf'^\s*{addr_family}\s+saddr\s+{re.escape(src_ip)}(?:/\d+)?'
+        rf'\s+drop\s+comment\s+"{re.escape(_NFTABLES_RULE_COMMENT)}"'
+        rf'\s+#\s*handle\s+(\d+)\s*$'
+    )
+
+    removed = 0
+    errors = []
+    for chain in chains:
+        try:
+            listed = subprocess.run(
+                ["nft", "-a", "list", "chain", family, table, chain],
+                capture_output=True,
+                text=True,
+                timeout=10
+            )
+        except subprocess.TimeoutExpired:
+            errors.append(f"{chain}: nft list timeout")
+            continue
+        except OSError as e:
+            errors.append(f"{chain}: không chạy được nft: {e}")
+            continue
+
+        if listed.returncode != 0:
+            errors.append(f"{chain}: {listed.stderr.strip()}")
+            continue
+
+        handles = []
+        for line in listed.stdout.splitlines():
+            match = rule_pattern.match(line)
+            if match:
+                handles.append(match.group(1))
+
+        for handle in handles:
+            try:
+                result = subprocess.run(
+                    ["nft", "delete", "rule", family, table, chain, "handle", handle],
+                    capture_output=True,
+                    text=True,
+                    timeout=10
+                )
+            except subprocess.TimeoutExpired:
+                errors.append(f"{chain} handle {handle}: nft delete timeout")
+                continue
+            except OSError as e:
+                errors.append(f"{chain} handle {handle}: không chạy được nft: {e}")
+                continue
+
+            if result.returncode != 0:
+                errors.append(f"{chain} handle {handle}: {result.stderr.strip()}")
+            else:
+                removed += 1
+
+    if errors:
+        msg = f"Không gỡ được đầy đủ rule cho IP {src_ip}: {'; '.join(errors)}"
+        write_action_log("unblock_ip", src_ip, False, msg)
+        return False, msg
+
+    if not removed:
+        msg = (
+            f"Không tìm thấy rule block do Mini-SOC quản lý cho IP {src_ip}. "
+            "Các rule cũ chưa có dấu nhận diện cần được xử lý thủ công."
+        )
+        write_action_log("unblock_ip", src_ip, False, msg)
+        return False, msg
+
+    msg = f"Đã gỡ {removed} rule block do Mini-SOC quản lý cho IP {src_ip}"
+    write_action_log("unblock_ip", src_ip, True, msg)
+    return True, msg
 
 
 def _send_telegram_confirm(src_ip: str, success: bool, message: str):
@@ -201,6 +292,7 @@ class TelegramResponder:
             help_text = (
                 "🤖 *Mini-SOC Assistant*\n"
                 "• `/block <ip>` — Block ngay một IP (có kiểm tra whitelist)\n"
+                "• `/unblock <ip>` — Gỡ các rule block do Mini-SOC tạo\n"
                 "• `/detail [ip hoặc alert_id]` — Xem lịch sử chi tiết từ log\n"
                 "• Hoặc nhắn tự nhiên (vd: _'Kiểm tra IP 1.2.3.4'_, _'Block giúp tôi IP 1.2.3.4'_)"
             )
@@ -226,6 +318,18 @@ class TelegramResponder:
 
             print(f"\n[Responder] Admin dùng lệnh /block IP: {target_ip}")
             block_ip(target_ip)
+            return
+
+        if lower.startswith("/unblock"):
+            parts = text.split(maxsplit=1)
+            if len(parts) < 2:
+                self._send_reply("Cú pháp: `/unblock <ip>`")
+                return
+
+            target_ip = parts[1].strip()
+            success, message = unblock_ip(target_ip)
+            prefix = "✅" if success else "❌"
+            self._send_reply(f"{prefix} {message}", parse_mode=None)
             return
 
         if lower.startswith("/detail"):

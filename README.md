@@ -72,8 +72,9 @@ TELEGRAM_CHAT_ID=your_telegram_chat_id_here
 ### 3. Kiểm tra `config.yaml`
 Chỉnh sửa các thông số phù hợp với hệ thống của bạn trong `config.yaml`:
 - `wazuh.alerts_file`: Đường dẫn file `alerts.json` của Wazuh (mặc định `/var/ossec/logs/alerts/alerts.json`).
-- `wazuh.min_level`: Ngưỡng level tối thiểu để xử lý alert (mặc định `7`).
+- `wazuh.min_level`: Ngưỡng level tối thiểu để xử lý alert (mặc định `10`).
 - `wazuh.lookback_minutes`: Số phút nhìn lại lịch sử alert cho cùng một IP (mặc định `10`).
+- `wazuh.cooldown_seconds`: Gộp alert cùng IP và cùng nhóm sự kiện trong khoảng thời gian này; nhóm sự kiện mới hoặc alert có level cao hơn vẫn được xử lý để không bỏ sót hành vi mới/escalation (mặc định `300`).
 - `llm`: `base_url`, `model`, `max_tokens`, `temperature` (hỗ trợ DeepSeek hoặc bất kỳ endpoint tương thích OpenAI nào).
 - `whitelist`: Danh sách IP hoặc subnet CIDR (ví dụ `192.168.1.0/24`) không bao giờ bị chặn.
 - `logging`: Đường dẫn `detail_log` và `action_log`.
@@ -103,7 +104,10 @@ Bot chỉ phản hồi đúng `TELEGRAM_CHAT_ID` đã cấu hình:
 - **Gửi lệnh trực tiếp:**
   - `/help` hoặc `/start`: Xem hướng dẫn nhanh.
   - `/block <ip>`: Kiểm tra IP hợp lệ + whitelist rồi thực thi chặn ngay qua `nftables`.
+  - `/unblock <ip>`: Gỡ các rule block do Mini-SOC tạo cho IP đó.
   - `/detail [ip hoặc alert_id]`: Xem tối đa 3 bản ghi phân tích chi tiết gần nhất từ `agent_detail.log` (bỏ trống tham số để xem 3 bản ghi mới nhất).
 - **Nhắn tin tự nhiên:**
   - Ví dụ: *"Kiểm tra giúp tôi IP 1.2.3.4"*, *"Lịch sử alert gần đây thế nào?"*, *"Block giúp tôi IP 1.2.3.4"*.
   - Python sẽ tự trích xuất IP/`alert_id`, thu thập dữ liệu từ log và `ss`, gửi AI tổng hợp trả lời. Nếu có yêu cầu block IP hợp lệ (không nằm trong whitelist), bot sẽ gửi kèm nút **`🚫 Xác nhận BLOCK <ip>`** để bạn bấm xác nhận.
+
+`/unblock` chỉ gỡ rule có dấu nhận diện do Mini-SOC thêm từ phiên bản này trở đi. Các rule block được tạo bởi phiên bản cũ không có dấu nhận diện nên cần gỡ thủ công để tránh xóa nhầm rule firewall khác.

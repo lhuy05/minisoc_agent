@@ -5,7 +5,7 @@
 # --- Wazuh ---
 wazuh:
   alerts_file: "/var/ossec/logs/alerts/alerts.json"
-  min_level: 8                      # Chỉ xử lý alert level >= 8
+  min_level: 10                     # Chỉ xử lý alert level >= 10
   lookback_minutes: 10              # query_recent_logs nhìn lại bao nhiêu phút
   cooldown_seconds: 300             # Chống spam: mỗi IP chỉ báo 1 lần trong N giây
   ignore_rules: []                  # Danh sách rule ID cần bỏ qua (để trống nếu không dùng)

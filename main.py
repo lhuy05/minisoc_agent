@@ -41,6 +41,65 @@ class AlertDeduplicator:
             return True
 
 
+class AlertCooldown:
+    def __init__(self, ttl_seconds: int = 300):
+        self._seen: dict[tuple[str, str], tuple[float, int]] = {}
+        self._ttl = ttl_seconds
+        self._lock = threading.Lock()
+
+    def should_process(self, src_ip: str, category: str, level: int) -> bool:
+        if self._ttl <= 0 or not src_ip or src_ip == "unknown":
+            return True
+        now = time.time()
+        key = (src_ip, category)
+        with self._lock:
+            self._seen = {
+                item: value for item, value in self._seen.items()
+                if now - value[0] < self._ttl
+            }
+            previous = self._seen.get(key)
+            if previous and level <= previous[1]:
+                return False
+            self._seen[key] = (now, level)
+            return True
+
+
+def _alert_category(alert: dict) -> str:
+    rule = alert.get("rule", {})
+    description = str(rule.get("description", "")).lower()
+    groups = {str(group).lower() for group in rule.get("groups", [])}
+
+    success_indicators = (
+        "followed by a success",
+        "successful login",
+        "login success",
+        "authentication success",
+        "accepted password",
+    )
+    if any(indicator in description for indicator in success_indicators) or any(
+        "authentication_success" in group for group in groups
+    ):
+        return "authentication-success"
+
+    failure_indicators = (
+        "authentication failure",
+        "authentication failures",
+        "failed login",
+        "failed logins",
+        "missed the password",
+        "brute force",
+        "failed password",
+    )
+    if any(indicator in description for indicator in failure_indicators) or any(
+        "authentication_failed" in group or "auth_fail" in group for group in groups
+    ):
+        return "authentication-failure"
+
+    if groups:
+        return "groups:" + ",".join(sorted(groups))
+    return f"rule:{rule.get('id', '')}"
+
+
 # ============================================================
 # Tail file realtime
 # ============================================================
@@ -102,7 +161,7 @@ def process_alert(
     alert: dict,
     min_level: int,
     dedup: AlertDeduplicator,
-    cooldown: AlertDeduplicator,
+    cooldown: AlertCooldown,
     ignore_rules: set[str],
     ignore_groups: set[str]
 ):
@@ -137,10 +196,9 @@ def process_alert(
     if not dedup.is_new(alert_id):
         return
 
-    # Cooldown theo (IP nguồn, rule_id): cùng IP + cùng loại tấn công mới bỏ qua, đổi loại tấn công vẫn báo
+    # Gộp alert cùng nhóm từ một IP, nhưng vẫn cho phép level tăng cao hơn.
     src_ip = _extract_source_ip(alert)
-    cooldown_key = f"ip:{src_ip}|rule:{rule_id}"
-    if not cooldown.is_new(cooldown_key):
+    if not cooldown.should_process(src_ip, _alert_category(alert), level):
         return
 
     ts = datetime.now().strftime("%H:%M:%S")
@@ -179,7 +237,7 @@ def main():
     print("  Mini-SOC AI Agent đang khởi động...")
     print(f"  File alerts : {alerts_file}")
     print(f"  Min level   : {min_level}")
-    print(f"  Cooldown    : {cooldown_seconds}s / IP")
+    print(f"  Cooldown    : {cooldown_seconds}s / IP + nhóm sự kiện")
     if ignore_rules:
         print(f"  Ignore rules: {', '.join(sorted(ignore_rules))}")
     if ignore_groups:
@@ -194,7 +252,7 @@ def main():
     # Khởi động tailer
     tailer = AlertTailer(alerts_file)
     dedup = AlertDeduplicator(ttl_seconds=60)
-    cooldown = AlertDeduplicator(ttl_seconds=cooldown_seconds)
+    cooldown = AlertCooldown(ttl_seconds=cooldown_seconds)
 
     # Graceful shutdown
     _shutdown = threading.Event()
