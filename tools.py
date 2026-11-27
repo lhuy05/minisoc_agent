@@ -7,6 +7,7 @@ import json
 import re
 import subprocess
 from datetime import datetime, timedelta
+from urllib.parse import urlparse
 
 from config_loader import load_config
 
@@ -14,9 +15,9 @@ from config_loader import load_config
 # ============================================================
 # Tool 1: Truy vấn các alert gần đây liên quan đến một IP
 # ============================================================
-def query_recent_logs(src_ip: str) -> dict:
+def query_recent_logs(src_ip: str, direction: str = "source") -> dict:
     """
-    Đọc lại alerts.json, tìm tất cả alert liên quan đến src_ip
+    Đọc lại alerts.json, tìm alert liên quan đến IP nguồn hoặc IP đích
     trong N phút gần nhất (config: lookback_minutes).
 
     Trả về:
@@ -29,6 +30,9 @@ def query_recent_logs(src_ip: str) -> dict:
             "raw_alerts": list[dict]   # tối đa 10 alert gần nhất
         }
     """
+    if direction not in ("source", "destination"):
+        return {"error": f"Hướng truy vấn không hợp lệ: {direction}"}
+
     cfg = load_config()
     alerts_file = cfg["wazuh"]["alerts_file"]
     lookback = cfg["wazuh"]["lookback_minutes"]
@@ -47,14 +51,46 @@ def query_recent_logs(src_ip: str) -> dict:
                 except json.JSONDecodeError:
                     continue
 
-                # Lấy IP nguồn từ các trường sự kiện mạng (không lấy agent.ip của victim)
-                alert_ip = (
-                    alert.get("data", {}).get("srcip")
-                    or alert.get("data", {}).get("src_ip")
-                    or alert.get("src_ip", "")
-                )
+                data = alert.get("data", {})
+                if not isinstance(data, dict):
+                    continue
 
-                if alert_ip != src_ip:
+                if direction == "source":
+                    alert_ip = (
+                        data.get("srcip")
+                        or data.get("src_ip")
+                        or alert.get("src_ip", "")
+                    )
+                    matches_ip = alert_ip == src_ip
+                else:
+                    alert_ip = (
+                        data.get("dstip")
+                        or data.get("dst_ip")
+                        or data.get("destination_ip")
+                    )
+                    matches_ip = alert_ip == src_ip
+                    if not matches_ip:
+                        audit = data.get("audit", {})
+                        execve = audit.get("execve", {}) if isinstance(audit, dict) else {}
+                        values = list(execve.values()) if isinstance(execve, dict) else []
+                        full_log = alert.get("full_log", "")
+                        if values and isinstance(full_log, str):
+                            values.append(full_log)
+                        for value in values:
+                            if not isinstance(value, str):
+                                continue
+                            for match in re.finditer(r"https?://[^\s\"'<>]+", value, re.IGNORECASE):
+                                try:
+                                    hostname = urlparse(match.group(0).rstrip(".,;:)]}")).hostname
+                                except ValueError:
+                                    continue
+                                if hostname == src_ip:
+                                    matches_ip = True
+                                    break
+                            if matches_ip:
+                                break
+
+                if not matches_ip:
                     continue
 
                 # Kiểm tra thời gian

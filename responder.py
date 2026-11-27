@@ -22,32 +22,42 @@ _NFTABLES_RULE_COMMENT = "mini-soc-managed"
 # ============================================================
 # Block IP bằng nftables
 # ============================================================
-def block_ip(src_ip: str) -> tuple[bool, str]:
-    """
-    Thêm rule nftables để drop toàn bộ traffic từ src_ip trên các chain (input, forward).
-    Trả về (success: bool, message: str)
-    """
+def block_ip(src_ip: str, direction: str = "source") -> tuple[bool, str]:
+    """Block IP nguồn hoặc IP đích trên các chain nftables đã cấu hình."""
+    if direction not in ("source", "destination"):
+        msg = f"Hướng block không hợp lệ: {direction}"
+        write_action_log("block_ip", src_ip, False, msg)
+        return False, msg
+
+    is_destination = direction == "destination"
+    action = "block_destination_ip" if is_destination else "block_ip"
+    addr_field = "daddr" if is_destination else "saddr"
+    direction_label = "IP đích" if is_destination else "IP nguồn"
+
     try:
         ip_obj = ipaddress.ip_address(src_ip)
     except ValueError:
         msg = f"IP không hợp lệ: {src_ip}"
-        write_action_log("block_ip", src_ip, False, msg)
+        write_action_log(action, src_ip, False, msg)
         return False, msg
 
     cfg = load_config()
     nft = cfg.get("nftables", {})
     family = nft.get("family", "inet")
     table = nft.get("table", "filter")
-    chains = nft.get("chains") or [nft.get("input_chain", "input")]
+    if is_destination:
+        chains = nft.get("destination_chains") or ["forward"]
+    else:
+        chains = nft.get("chains") or [nft.get("input_chain", "input")]
     addr_family = "ip6" if ip_obj.version == 6 else "ip"
 
     errors = []
     try:
         for chain in chains:
             cmd = [
-                "nft", "insert", "rule",
+                "sudo", "/usr/sbin/nft", "insert", "rule",
                 family, table, chain,
-                addr_family, "saddr", src_ip,
+                addr_family, addr_field, str(ip_obj),
                 "drop", "comment", _NFTABLES_RULE_COMMENT
             ]
             result = subprocess.run(
@@ -60,33 +70,43 @@ def block_ip(src_ip: str) -> tuple[bool, str]:
                 errors.append(f"{chain}: {result.stderr.strip()}")
 
         if not errors:
-            msg = f"Đã block IP {src_ip} trên chain {', '.join(chains)}"
-            write_action_log("block_ip", src_ip, True, msg)
-            _send_telegram_confirm(src_ip, True, msg)
+            msg = f"Đã block {direction_label} {ip_obj} trên chain {', '.join(chains)}"
+            write_action_log(action, str(ip_obj), True, msg)
+            _send_telegram_confirm(str(ip_obj), True, msg, direction=direction)
             return True, msg
         else:
             msg = f"nftables lỗi ({'; '.join(errors)})"
-            write_action_log("block_ip", src_ip, False, msg)
-            _send_telegram_confirm(src_ip, False, msg)
+            write_action_log(action, str(ip_obj), False, msg)
+            _send_telegram_confirm(str(ip_obj), False, msg, direction=direction)
             return False, msg
 
     except subprocess.TimeoutExpired:
         msg = "Lệnh nftables timeout"
-        write_action_log("block_ip", src_ip, False, msg)
+        write_action_log(action, str(ip_obj), False, msg)
         return False, msg
     except Exception as e:
         msg = f"Lỗi: {str(e)}"
-        write_action_log("block_ip", src_ip, False, msg)
+        write_action_log(action, str(ip_obj), False, msg)
         return False, msg
 
 
-def unblock_ip(src_ip: str) -> tuple[bool, str]:
-    """Gỡ các rule drop do Mini-SOC tạo cho IP này."""
+def unblock_ip(src_ip: str, direction: str = "source") -> tuple[bool, str]:
+    """Gỡ rule block IP nguồn hoặc IP đích do Mini-SOC tạo."""
+    if direction not in ("source", "destination"):
+        msg = f"Hướng unblock không hợp lệ: {direction}"
+        write_action_log("unblock_ip", src_ip, False, msg)
+        return False, msg
+
+    is_destination = direction == "destination"
+    action = "unblock_destination_ip" if is_destination else "unblock_ip"
+    addr_field = "daddr" if is_destination else "saddr"
+    direction_label = "IP đích" if is_destination else "IP nguồn"
+
     try:
         ip_obj = ipaddress.ip_address(src_ip)
     except ValueError:
         msg = f"IP không hợp lệ: {src_ip}"
-        write_action_log("unblock_ip", src_ip, False, msg)
+        write_action_log(action, src_ip, False, msg)
         return False, msg
 
     src_ip = str(ip_obj)
@@ -94,10 +114,13 @@ def unblock_ip(src_ip: str) -> tuple[bool, str]:
     nft = cfg.get("nftables", {})
     family = nft.get("family", "inet")
     table = nft.get("table", "filter")
-    chains = nft.get("chains") or [nft.get("input_chain", "input")]
+    if is_destination:
+        chains = nft.get("destination_chains") or ["forward"]
+    else:
+        chains = nft.get("chains") or [nft.get("input_chain", "input")]
     addr_family = "ip6" if ip_obj.version == 6 else "ip"
     rule_pattern = re.compile(
-        rf'^\s*{addr_family}\s+saddr\s+{re.escape(src_ip)}(?:/\d+)?'
+        rf'^\s*{addr_family}\s+{addr_field}\s+{re.escape(src_ip)}(?:/\d+)?'
         rf'\s+drop\s+comment\s+"{re.escape(_NFTABLES_RULE_COMMENT)}"'
         rf'\s+#\s*handle\s+(\d+)\s*$'
     )
@@ -107,7 +130,7 @@ def unblock_ip(src_ip: str) -> tuple[bool, str]:
     for chain in chains:
         try:
             listed = subprocess.run(
-                ["nft", "-a", "list", "chain", family, table, chain],
+                ["sudo", "/usr/sbin/nft", "-a", "list", "chain", family, table, chain],
                 capture_output=True,
                 text=True,
                 timeout=10
@@ -132,7 +155,7 @@ def unblock_ip(src_ip: str) -> tuple[bool, str]:
         for handle in handles:
             try:
                 result = subprocess.run(
-                    ["nft", "delete", "rule", family, table, chain, "handle", handle],
+                    ["sudo", "/usr/sbin/nft", "delete", "rule", family, table, chain, "handle", handle],
                     capture_output=True,
                     text=True,
                     timeout=10
@@ -150,32 +173,33 @@ def unblock_ip(src_ip: str) -> tuple[bool, str]:
                 removed += 1
 
     if errors:
-        msg = f"Không gỡ được đầy đủ rule cho IP {src_ip}: {'; '.join(errors)}"
-        write_action_log("unblock_ip", src_ip, False, msg)
+        msg = f"Không gỡ được đầy đủ rule cho {direction_label} {src_ip}: {'; '.join(errors)}"
+        write_action_log(action, src_ip, False, msg)
         return False, msg
 
     if not removed:
         msg = (
-            f"Không tìm thấy rule block do Mini-SOC quản lý cho IP {src_ip}. "
+            f"Không tìm thấy rule block do Mini-SOC quản lý cho {direction_label} {src_ip}. "
             "Các rule cũ chưa có dấu nhận diện cần được xử lý thủ công."
         )
-        write_action_log("unblock_ip", src_ip, False, msg)
+        write_action_log(action, src_ip, False, msg)
         return False, msg
 
-    msg = f"Đã gỡ {removed} rule block do Mini-SOC quản lý cho IP {src_ip}"
-    write_action_log("unblock_ip", src_ip, True, msg)
+    msg = f"Đã gỡ {removed} rule block do Mini-SOC quản lý cho {direction_label} {src_ip}"
+    write_action_log(action, src_ip, True, msg)
     return True, msg
 
 
-def _send_telegram_confirm(src_ip: str, success: bool, message: str):
+def _send_telegram_confirm(src_ip: str, success: bool, message: str, direction: str = "source"):
     """Gửi thông báo kết quả block về Telegram."""
     cfg = load_config()
     tg = cfg["telegram"]
+    direction_label = "IP đích/C2" if direction == "destination" else "IP nguồn"
 
     if success:
-        text = f"✅ *BLOCK THÀNH CÔNG*\nIP `{src_ip}` đã bị chặn bởi nftables."
+        text = f"✅ *BLOCK THÀNH CÔNG*\n{direction_label} `{src_ip}` đã bị chặn bởi nftables."
     else:
-        text = f"❌ *BLOCK THẤT BẠI*\nIP `{src_ip}` — Lỗi: {message}"
+        text = f"❌ *BLOCK THẤT BẠI*\n{direction_label} `{src_ip}` — Lỗi: {message}"
 
     url = f"https://api.telegram.org/bot{tg['bot_token']}/sendMessage"
     try:
@@ -272,10 +296,25 @@ class TelegramResponder:
         # Trả lời callback để nút không bị loading mãi
         self._answer_callback(callback_id)
 
-        if data.startswith("block:"):
-            src_ip = data.split(":", 1)[1]
-            print(f"\n[Responder] Admin yêu cầu block IP: {src_ip}")
-            success, msg = block_ip(src_ip)
+        block_callbacks = {
+            "block": "source",
+            "block-src": "source",
+            "block-dst": "destination",
+        }
+        callback_action, separator, target_ip = data.partition(":")
+        if separator and callback_action in block_callbacks:
+            direction = block_callbacks[callback_action]
+            whitelist = check_ip_whitelist(target_ip)
+            if whitelist.get("is_whitelisted"):
+                msg = f"Từ chối block `{target_ip}`: {whitelist.get('reason')}"
+                self._send_reply(msg)
+                print(f"\n[Responder] {msg}")
+                return
+
+            print(
+                f"\n[Responder] Admin yêu cầu block {direction} IP: {target_ip}"
+            )
+            success, msg = block_ip(target_ip, direction=direction)
             status = "✅ Thành công" if success else "❌ Thất bại"
             print(f"[Responder] {status} — {msg}")
 
@@ -291,18 +330,28 @@ class TelegramResponder:
         if lower in ("/start", "/help"):
             help_text = (
                 "🤖 *Mini-SOC Assistant*\n"
-                "• `/block <ip>` — Block ngay một IP (có kiểm tra whitelist)\n"
+                "• `/block <ip>` — Block IP nguồn (có kiểm tra whitelist)\n"
+                "• `/block-src <ip>` — Block IP nguồn\n"
+                "• `/block-dst <ip>` — Chặn traffic đi tới IP đích/C2 trên chain forward\n"
                 "• `/unblock <ip>` — Gỡ các rule block do Mini-SOC tạo\n"
+                "• `/unblock-src <ip>` — Gỡ rule block IP nguồn\n"
+                "• `/unblock-dst <ip>` — Gỡ rule chặn IP đích/C2\n"
                 "• `/detail [ip hoặc alert_id]` — Xem lịch sử chi tiết từ log\n"
                 "• Hoặc nhắn tự nhiên (vd: _'Kiểm tra IP 1.2.3.4'_, _'Block giúp tôi IP 1.2.3.4'_)"
             )
             self._send_reply(help_text)
             return
 
-        if lower.startswith("/block"):
-            parts = text.split(maxsplit=1)
+        parts = text.split(maxsplit=1)
+        command = parts[0].split("@", 1)[0].lower() if parts else ""
+        block_directions = {
+            "/block": "source",
+            "/block-src": "source",
+            "/block-dst": "destination",
+        }
+        if command in block_directions:
             if len(parts) < 2:
-                self._send_reply("Cú pháp: `/block <ip>`")
+                self._send_reply(f"Cú pháp: `{command} <ip>`")
                 return
             target_ip = parts[1].strip()
             try:
@@ -316,18 +365,24 @@ class TelegramResponder:
                 self._send_reply(f"⛔ Từ chối block `{target_ip}`: {wl.get('reason')}")
                 return
 
-            print(f"\n[Responder] Admin dùng lệnh /block IP: {target_ip}")
-            block_ip(target_ip)
+            direction = block_directions[command]
+            print(f"\n[Responder] Admin dùng lệnh {command} IP: {target_ip}")
+            block_ip(target_ip, direction=direction)
             return
 
-        if lower.startswith("/unblock"):
-            parts = text.split(maxsplit=1)
+        unblock_directions = {
+            "/unblock": "source",
+            "/unblock-src": "source",
+            "/unblock-dst": "destination",
+        }
+        if command in unblock_directions:
             if len(parts) < 2:
-                self._send_reply("Cú pháp: `/unblock <ip>`")
+                self._send_reply(f"Cú pháp: `{command} <ip>`")
                 return
 
             target_ip = parts[1].strip()
-            success, message = unblock_ip(target_ip)
+            direction = unblock_directions[command]
+            success, message = unblock_ip(target_ip, direction=direction)
             prefix = "✅" if success else "❌"
             self._send_reply(f"{prefix} {message}", parse_mode=None)
             return

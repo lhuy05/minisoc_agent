@@ -6,6 +6,7 @@ import ipaddress
 import json
 import re
 from openai import OpenAI
+from urllib.parse import urlparse
 
 from config_loader import load_config
 from tools import (
@@ -25,19 +26,25 @@ Nhiệm vụ của bạn:
 Quy tắc bắt buộc:
 - Dữ liệu whitelist, lịch sử alert và kết nối active được lấy từ hệ thống; không tự suy đoán hoặc sửa các dữ liệu này
 - Nếu IP nằm trong whitelist: KHÔNG đề xuất block, chỉ cảnh báo để theo dõi
+- src_ip là IP nguồn của flow; với tiến trình audit outbound, dùng agent.ip làm IP cục bộ và không coi đó mặc định là hacker
+- destination_ip là IP đích/remote/C2 trích từ trường đích hoặc URL nếu có
+- Đề xuất block chỉ áp dụng cho BLOCK TARGET IP và BLOCK DIRECTION được cung cấp; không đổi hướng hoặc thay IP mục tiêu
+- Chỉ trả về JSON hợp lệ, không dùng Markdown/code fence hoặc thêm văn bản ngoài JSON
+- summary tối đa 2 câu; detail tối đa 3 gạch đầu dòng ngắn, không lặp lại toàn bộ lịch sử alert
 
 Định dạng output cuối cùng (JSON, không giải thích thêm):
 {
-    "src_ip": "IP nguồn",
+    "src_ip": "IP nguồn của flow; với tiến trình outbound dùng IP agent cục bộ",
+    "destination_ip": "IP đích/C2 nếu xác định được; nếu không, ghi unknown",
     "attack_type": "Loại tấn công",
     "severity": "CRITICAL|HIGH|MEDIUM|LOW",
     "mitre_technique": "Txx - Tên kỹ thuật",
     "summary": "Mô tả ngắn gọn tình huống (1-2 câu)",
-    "still_active": true/false,
+    "still_active": true/false/null",
     "is_whitelisted": true/false,
     "recommend_block": true/false,
     "recommendation": "Hành động đề xuất cụ thể",
-    "detail": "Phân tích chi tiết đầy đủ"
+    "detail": "Tối đa 3 gạch đầu dòng ngắn"
 }"""
 
 
@@ -57,15 +64,18 @@ def run_agent(alert: dict) -> dict:
     )
 
     src_ip = _extract_source_ip(alert)
-    if src_ip == "unknown":
+    destination_ip = _extract_destination_ip(alert)
+    is_outbound_flow = _is_outbound_alert(alert)
+    block_direction, block_target_ip = _get_block_candidate(alert)
+    if block_target_ip == "unknown":
         tool_results = {
             "whitelist": {
-                "ip": src_ip,
+                "ip": block_target_ip,
                 "is_whitelisted": False,
-                "reason": "Không xác định được IP nguồn"
+                "reason": "Không xác định được IP mục tiêu để block"
             },
             "recent_logs": {
-                "ip": src_ip,
+                "ip": block_target_ip,
                 "count": 0,
                 "alert_types": [],
                 "first_seen": None,
@@ -73,20 +83,26 @@ def run_agent(alert: dict) -> dict:
                 "raw_alerts": []
             },
             "active_connections": {
-                "ip": src_ip,
+                "ip": block_target_ip,
                 "active_count": 0,
                 "connections": [],
-                "still_active": False
+                "still_active": None
             },
         }
     else:
         tool_results = {
-            "whitelist": check_ip_whitelist(src_ip),
-            "recent_logs": query_recent_logs(src_ip),
-            "active_connections": get_active_connections(src_ip),
+            "whitelist": check_ip_whitelist(block_target_ip),
+            "recent_logs": query_recent_logs(block_target_ip, direction=block_direction),
+            "active_connections": (
+                {"ip": block_target_ip, "active_count": 0, "connections": [], "still_active": None}
+                if is_outbound_flow
+                else get_active_connections(block_target_ip)
+            ),
         }
 
-    user_message = _build_user_message(alert, tool_results)
+    user_message = _build_user_message(
+        alert, tool_results, block_direction, block_target_ip
+    )
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": user_message}
@@ -102,6 +118,9 @@ def run_agent(alert: dict) -> dict:
     content = response.choices[0].message.content or ""
     result = _parse_final_output(content, alert)
     result["src_ip"] = src_ip
+    result["destination_ip"] = destination_ip
+    result["block_direction"] = block_direction
+    result["block_target_ip"] = block_target_ip
 
     whitelist_result = tool_results["whitelist"]
     is_whitelisted = whitelist_result.get("is_whitelisted")
@@ -115,35 +134,139 @@ def run_agent(alert: dict) -> dict:
 
     if result["is_whitelisted"]:
         result["recommend_block"] = False
-        result["recommendation"] = "IP nằm trong whitelist; không block, chỉ cảnh báo và theo dõi."
-    elif src_ip == "unknown":
+        result["recommendation"] = "IP mục tiêu nằm trong whitelist; không block, chỉ cảnh báo và theo dõi."
+    elif block_target_ip == "unknown":
         result["recommend_block"] = False
+        result["still_active"] = None
 
     active_result = tool_results["active_connections"]
     still_active = active_result.get("still_active")
     if isinstance(still_active, bool):
         result["still_active"] = still_active
+    else:
+        result["still_active"] = None
 
     return result
 
 
 def _extract_source_ip(alert: dict) -> str:
-    """Lấy IP nguồn từ các trường sự kiện mạng (không lấy agent.ip của victim)."""
+    """Lấy IP nguồn của flow; với tiến trình outbound dùng IP agent làm IP cục bộ."""
     data = alert.get("data", {})
-    return (
+    source_ip = (
         data.get("srcip")
         or data.get("src_ip")
         or alert.get("src_ip")
-        or "unknown"
     )
+    if source_ip:
+        return source_ip
+
+    if _is_outbound_alert(alert):
+        agent_ip = alert.get("agent", {}).get("ip")
+        if isinstance(agent_ip, str):
+            try:
+                return str(ipaddress.ip_address(agent_ip))
+            except ValueError:
+                pass
+
+    return "unknown"
 
 
-def _build_user_message(alert: dict, tool_results: dict) -> str:
+def _extract_destination_ip(alert: dict) -> str:
+    """Lấy IP đích từ field mạng hoặc URL trong dữ liệu tiến trình/audit."""
+    data = alert.get("data", {})
+    if not isinstance(data, dict):
+        return "unknown"
+
+    for key in ("dstip", "dst_ip", "destination_ip"):
+        value = data.get(key)
+        if isinstance(value, str):
+            try:
+                return str(ipaddress.ip_address(value))
+            except ValueError:
+                pass
+
+    audit = data.get("audit", {})
+    execve = audit.get("execve", {}) if isinstance(audit, dict) else {}
+    values = list(execve.values()) if isinstance(execve, dict) else []
+    full_log = alert.get("full_log", "")
+    if values and isinstance(full_log, str):
+        values.append(full_log)
+
+    for value in values:
+        if not isinstance(value, str):
+            continue
+        for match in re.finditer(r"https?://[^\s\"'<>]+", value, re.IGNORECASE):
+            try:
+                hostname = urlparse(match.group(0).rstrip(".,;:)]}")).hostname
+            except ValueError:
+                continue
+            if hostname:
+                try:
+                    return str(ipaddress.ip_address(hostname))
+                except ValueError:
+                    continue
+
+    return "unknown"
+
+
+def _is_outbound_alert(alert: dict) -> bool:
+    data = alert.get("data", {})
+    audit = data.get("audit", {}) if isinstance(data, dict) else {}
+    execve = audit.get("execve", {}) if isinstance(audit, dict) else {}
+    values = list(execve.values()) if isinstance(execve, dict) else []
+    full_log = alert.get("full_log", "")
+    if values and isinstance(full_log, str):
+        values.append(full_log)
+    if any(
+        isinstance(value, str)
+        and re.search(r"https?://", value, re.IGNORECASE)
+        for value in values
+    ):
+        return True
+
+    agent_ip = alert.get("agent", {}).get("ip")
+    source_ip = (
+        data.get("srcip")
+        or data.get("src_ip")
+        or alert.get("src_ip")
+    ) if isinstance(data, dict) else alert.get("src_ip")
+    if not isinstance(agent_ip, str) or not isinstance(source_ip, str):
+        return False
+
+    try:
+        return (
+            ipaddress.ip_address(agent_ip) == ipaddress.ip_address(source_ip)
+            and _extract_destination_ip(alert) != "unknown"
+        )
+    except ValueError:
+        return False
+
+
+def _get_block_candidate(alert: dict) -> tuple[str, str]:
+    if _is_outbound_alert(alert):
+        destination_ip = _extract_destination_ip(alert)
+        if destination_ip != "unknown":
+            return "destination", destination_ip
+        return "none", "unknown"
+
+    source_ip = _extract_source_ip(alert)
+    if source_ip != "unknown":
+        return "source", source_ip
+    return "none", "unknown"
+
+
+def _build_user_message(
+    alert: dict,
+    tool_results: dict,
+    block_direction: str,
+    block_target_ip: str
+) -> str:
     """Tạo message gồm alert và dữ liệu đã thu thập bằng Python."""
     rule = alert.get("rule", {})
     data = alert.get("data", {})
     agent = alert.get("agent", {})
     src_ip = _extract_source_ip(alert)
+    destination_ip = _extract_destination_ip(alert)
 
     return f"""Phân tích alert an ninh sau đây:
 
@@ -154,6 +277,9 @@ RULE LEVEL   : {rule.get('level', 'N/A')}
 DESCRIPTION  : {rule.get('description', 'N/A')}
 GROUPS       : {', '.join(rule.get('groups', []))}
 SOURCE IP    : {src_ip}
+DESTINATION IP / C2: {destination_ip}
+BLOCK DIRECTION: {block_direction}
+BLOCK TARGET IP: {block_target_ip}
 AGENT NAME   : {agent.get('name', 'N/A')}
 AGENT IP     : {agent.get('ip', 'N/A')}
 FULL DATA    : {json.dumps(data, ensure_ascii=False)}
@@ -178,9 +304,15 @@ def _parse_final_output(content: str, alert: dict) -> dict:
             result = json.loads(content[start:end])
             # Đảm bảo có đủ trường
             result.setdefault("src_ip", _extract_source_ip(alert))
+            result.setdefault("destination_ip", _extract_destination_ip(alert))
+            direction, target_ip = _get_block_candidate(alert)
+            result.setdefault("block_direction", direction)
+            result.setdefault("block_target_ip", target_ip)
             result.setdefault("attack_type", alert.get("rule", {}).get("description", "Unknown"))
             result.setdefault("severity", "MEDIUM")
-            result.setdefault("mitre_technique", "Unknown")
+            result.setdefault("mitre_technique", _extract_alert_mitre(alert))
+            if result["mitre_technique"] in (None, "", "Unknown"):
+                result["mitre_technique"] = _extract_alert_mitre(alert)
             result.setdefault("summary", "Không có tóm tắt")
             result.setdefault("still_active", False)
             result.setdefault("is_whitelisted", False)
@@ -191,19 +323,50 @@ def _parse_final_output(content: str, alert: dict) -> dict:
         except json.JSONDecodeError:
             pass
 
-    # Fallback nếu LLM không trả JSON đúng định dạng
+    # Fallback to alert metadata when the LLM response is unavailable or invalid.
     return {
         "src_ip": _extract_source_ip(alert),
+        "destination_ip": _extract_destination_ip(alert),
+        "block_direction": _get_block_candidate(alert)[0],
+        "block_target_ip": _get_block_candidate(alert)[1],
         "attack_type": alert.get("rule", {}).get("description", "Unknown"),
         "severity": "MEDIUM",
-        "mitre_technique": "Unknown",
-        "summary": content[:200] if content else "Không có phân tích",
-        "still_active": False,
+        "mitre_technique": _extract_alert_mitre(alert),
+        "summary": "AI không phân tích được phản hồi; hiển thị dữ liệu từ rule Wazuh.",
+        "still_active": None,
         "is_whitelisted": False,
         "recommend_block": False,
         "recommendation": "Kiểm tra thủ công",
         "detail": content
     }
+
+
+def _extract_alert_mitre(alert: dict) -> str:
+    """Lấy MITRE ATT&CK từ metadata của rule Wazuh."""
+    mitre = alert.get("rule", {}).get("mitre", {})
+    if not isinstance(mitre, dict):
+        return "Unknown"
+
+    raw_ids = mitre.get("id", [])
+    raw_techniques = mitre.get("technique", [])
+    ids = [raw_ids] if isinstance(raw_ids, str) else raw_ids
+    techniques = [raw_techniques] if isinstance(raw_techniques, str) else raw_techniques
+    if not isinstance(ids, list):
+        ids = []
+    if not isinstance(techniques, list):
+        techniques = []
+
+    formatted = []
+    for index, technique_id in enumerate(ids):
+        if not isinstance(technique_id, str) or not technique_id.strip():
+            continue
+        technique_name = techniques[index] if index < len(techniques) else ""
+        if isinstance(technique_name, str) and technique_name.strip():
+            formatted.append(f"{technique_id} - {technique_name}")
+        else:
+            formatted.append(technique_id)
+
+    return "; ".join(formatted) if formatted else "Unknown"
 
 
 ADMIN_CHAT_SYSTEM_PROMPT = """Bạn là trợ lý AI của hệ thống Mini-SOC trên Telegram, hỗ trợ admin tra cứu lịch sử alert và xử lý sự cố.

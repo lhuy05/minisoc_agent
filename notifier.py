@@ -38,20 +38,33 @@ def print_console(result: dict):
     severity = result.get("severity", "MEDIUM")
     color = SEVERITY_COLOR.get(severity, Color.CYAN)
     ts = datetime.now().strftime("%H:%M:%S")
+    still_active = result.get("still_active")
+    active_status = (
+        "⚠ CÒN KẾT NỐI" if still_active is True
+        else "Không" if still_active is False
+        else "Chưa kiểm tra"
+    )
 
     print(f"\n{color}{Color.BOLD}{'='*55}{Color.RESET}")
     print(f"{color}{Color.BOLD}[{ts}] CẢNH BÁO AN NINH — {severity}{Color.RESET}")
     print(f"{color}{'='*55}{Color.RESET}")
     print(f"  IP nguồn   : {Color.BOLD}{result.get('src_ip', 'N/A')}{Color.RESET}")
+    print(f"  IP đích/C2    : {result.get('destination_ip', 'unknown')}")
     print(f"  Tấn công   : {result.get('attack_type', 'N/A')}")
     print(f"  MITRE      : {result.get('mitre_technique', 'N/A')}")
-    print(f"  Còn active : {'⚠ CÒN KẾT NỐI' if result.get('still_active') else 'Không'}")
-    print(f"  Whitelist  : {'✓ Có (không block)' if result.get('is_whitelisted') else 'Không'}")
+    print(f"  Còn active : {active_status}")
+    print(f"  Mục tiêu block trong whitelist: {'Có' if result.get('is_whitelisted') else 'Không'}")
     print(f"\n  {Color.BOLD}Tóm tắt:{Color.RESET} {result.get('summary', '')}")
     print(f"\n  {Color.BOLD}Đề xuất:{Color.RESET} {result.get('recommendation', '')}")
 
     if result.get("recommend_block"):
-        print(f"\n  {Color.RED}{Color.BOLD}→ AGENT ĐỀ XUẤT BLOCK IP NÀY{Color.RESET}")
+        direction = result.get("block_direction", "source")
+        target_ip = result.get("block_target_ip", result.get("src_ip", "unknown"))
+        target_label = "IP đích/C2" if direction == "destination" else "IP nguồn"
+        print(
+            f"\n  {Color.RED}{Color.BOLD}→ AGENT ĐỀ XUẤT BLOCK "
+            f"{target_label} {target_ip}{Color.RESET}"
+        )
     print(f"{color}{'='*55}{Color.RESET}")
 
 
@@ -103,6 +116,15 @@ def send_telegram(result: dict):
 
     severity = result.get("severity", "MEDIUM")
     src_ip = result.get("src_ip", "N/A")
+    destination_ip = result.get("destination_ip", "unknown")
+    block_direction = result.get("block_direction", "none")
+    block_target_ip = result.get("block_target_ip", "unknown")
+    still_active = result.get("still_active")
+    active_status = (
+        "⚠ CÒN KẾT NỐI" if still_active is True
+        else "Không" if still_active is False
+        else "Chưa kiểm tra"
+    )
 
     # Icon theo severity
     icon = {"CRITICAL": "🔴", "HIGH": "🟠", "MEDIUM": "🟡", "LOW": "🟢"}.get(severity, "⚪")
@@ -111,25 +133,34 @@ def send_telegram(result: dict):
         f"{icon} <b>CẢNH BÁO AN NINH — {escape(str(severity))}</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"🌐 <b>IP nguồn:</b> <code>{escape(str(src_ip))}</code>\n"
+        f"🎯 <b>IP đích/C2:</b> <code>{escape(str(destination_ip))}</code>\n"
         f"⚔️ <b>Tấn công:</b> {escape(str(result.get('attack_type', 'N/A')))}\n"
         f"🎯 <b>MITRE:</b> {escape(str(result.get('mitre_technique', 'N/A')))}\n"
-        f"🔌 <b>Còn active:</b> {'⚠ CÒN KẾT NỐI' if result.get('still_active') else 'Không'}\n"
+        f"🔌 <b>Còn active:</b> {escape(active_status)}\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"📋 <b>Tóm tắt:</b> {escape(str(result.get('summary', '')))}\n\n"
         f"💡 <b>Đề xuất:</b> {escape(str(result.get('recommendation', '')))}"
     )
 
-    # Chỉ hiện nút BLOCK nếu agent đề xuất block và IP không trong whitelist
-    if result.get("recommend_block") and not result.get("is_whitelisted"):
+    # Only offer a block action for a validated target and explicit direction.
+    if (
+        result.get("recommend_block")
+        and not result.get("is_whitelisted")
+        and block_direction in ("source", "destination")
+        and block_target_ip not in ("", "unknown", None)
+    ):
+        is_destination = block_direction == "destination"
+        block_label = "IP ĐÍCH/C2" if is_destination else "IP NGUỒN"
+        block_callback = "block-dst" if is_destination else "block-src"
         keyboard = {
             "inline_keyboard": [[
                 {
-                    "text": f"🚫 BLOCK {src_ip}",
-                    "callback_data": f"block:{src_ip}"
+                    "text": f"🚫 BLOCK {block_label} {block_target_ip}",
+                    "callback_data": f"{block_callback}:{block_target_ip}"
                 },
                 {
                     "text": "❌ Bỏ qua",
-                    "callback_data": f"ignore:{src_ip}"
+                    "callback_data": f"ignore:{block_target_ip}"
                 }
             ]]
         }
@@ -138,7 +169,7 @@ def send_telegram(result: dict):
             "inline_keyboard": [[
                 {
                     "text": "👁 Theo dõi",
-                    "callback_data": f"ignore:{src_ip}"
+                    "callback_data": f"ignore:{block_target_ip}"
                 }
             ]]
         }

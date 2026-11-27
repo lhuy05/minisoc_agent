@@ -15,7 +15,7 @@ wazuh:
 llm:
   base_url: "https://api.deepseek.com"
   model: "deepseek-flash"
-  max_tokens: 1024
+  max_tokens: 2048
   temperature: 0.2                  # Thấp để output ổn định, ít hallucination
 
 # --- Telegram (bot_token & chat_id được nạp từ TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID / file .env) ---
@@ -38,4 +38,6 @@ nftables:
   table: "filter"
   chains:
     - "input"
+    - "forward"
+  destination_chains:
     - "forward"
